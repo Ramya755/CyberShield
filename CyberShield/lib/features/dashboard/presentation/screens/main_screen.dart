@@ -1,7 +1,6 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import '../models/threat.dart';
-import '../data/api/api_service.dart';
+import 'package:provider/provider.dart';
 
 class MainScreen extends StatefulWidget {
   const MainScreen({
@@ -19,25 +18,30 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int selectedIndex = 0;
+  int cyberShieldScore = 100;
+
+  void updateCyberShieldScore(int score) {
+    setState(() {
+      cyberShieldScore = score;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final screens = [
-      const HomeScreen(),
+      HomeScreen(onScoreCalculated: updateCyberShieldScore),
       const SmsScreen(),
       const LinksScreen(),
       const ReportScreen(),
       ProfileScreen(
         isDark: widget.isDark,
         onThemeChanged: widget.onThemeChanged,
+        cyberShieldScore: cyberShieldScore,
       ),
     ];
 
     return Scaffold(
-      body: IndexedStack(
-        index: selectedIndex,
-        children: screens,
-      ),
+      body: IndexedStack(index: selectedIndex, children: screens),
       bottomNavigationBar: Container(
         height: 75,
         decoration: BoxDecoration(
@@ -86,38 +90,109 @@ class _MainScreenState extends State<MainScreen> {
 // ================= HOME SCREEN =================
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({super.key, required this.onScoreCalculated});
+
+  final ValueChanged<int> onScoreCalculated;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  late Future<List<Threat>> _threatsFuture;
+  final List<Map<String, dynamic>> _linkThreats = [];
 
   @override
   void initState() {
     super.initState();
-    _threatsFuture = ApiService.getRecentThreats();
+    _calculateAndNotifyScore();
   }
 
-  // This must return a Future for RefreshIndicator to work
+  void _calculateAndNotifyScore() {
+    final score = _calculateDynamicScore();
+    widget.onScoreCalculated(score);
+  }
+
+  /// Calculate CyberShield Score from SMS and Link detection data
+  int _calculateDynamicScore() {
+    try {
+      // Get SMS detection stats (if provider is available)
+      int totalScanned = 0;
+      int totalScams = 0;
+      int safeMessages = 0;
+
+      try {
+        final smsProvider = context.read<ScamDetectionProvider?>();
+        if (smsProvider != null) {
+          totalScanned = smsProvider.totalScanned;
+          totalScams = smsProvider.totalScams;
+          safeMessages = smsProvider.safeMessages;
+        }
+      } catch (e) {
+        debugPrint('SMS Provider not available: $e');
+      }
+
+      // Get Link scanning stats (if provider is available)
+      int linkThreatsDetected = _linkThreats.length;
+      int dangerousLinks = _linkThreats.where((t) => (t['riskScore'] as int?) ?? 0 > 70).length;
+
+      // Calculate score based on detection data
+      int score = 100;
+
+      // SMS scoring
+      if (totalScanned > 0) {
+        final scamPercentage = (totalScams / totalScanned) * 100;
+        score -= (scamPercentage * 0.3).toInt(); // 30% weight
+      }
+
+      // Link scoring
+      if (linkThreatsDetected > 0) {
+        final dangerousPercentage = (dangerousLinks / linkThreatsDetected) * 100;
+        score -= (dangerousPercentage * 0.2).toInt(); // 20% weight
+      }
+
+      // Threat diversity bonus/penalty
+      int threatTypes = 0;
+      if (totalScams > 0) threatTypes++;
+      if (dangerousLinks > 0) threatTypes++;
+
+      if (threatTypes > 1) {
+        score -= 15; // Multiple threat types detected
+      }
+
+      // Safety bonus if no threats
+      if (totalScams == 0 && linkThreatsDetected == 0) {
+        score = 100;
+      }
+
+      return score.clamp(0, 100);
+    } catch (e) {
+      debugPrint('Error calculating score: $e');
+      return 85; // Safe default
+    }
+  }
+
   Future<void> _refreshThreats() async {
+    await Future.delayed(const Duration(seconds: 1));
     setState(() {
-      _threatsFuture = ApiService.getRecentThreats();
+      _calculateAndNotifyScore();
     });
-    await _threatsFuture;
   }
 
   @override
   Widget build(BuildContext context) {
     final cardColor = Theme.of(context).cardColor;
     final textColor = Theme.of(context).textTheme.bodyLarge?.color;
+    final score = _calculateDynamicScore();
+
+    // Notify parent of score changes
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.onScoreCalculated(score);
+    });
 
     return Scaffold(
       body: SafeArea(
         child: RefreshIndicator(
-          onRefresh: _refreshThreats, // FIXED: Used onRefresh instead of onPressed
+          onRefresh: _refreshThreats,
           child: SingleChildScrollView(
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(18, 18, 18, 90),
@@ -138,43 +213,20 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     IconButton(
                       tooltip: 'Refresh threats',
-                      onPressed: _refreshThreats, // Standard buttons use onPressed
+                      onPressed: _refreshThreats,
                       icon: const Icon(Icons.refresh),
                     ),
                   ],
                 ),
                 const SizedBox(height: 40),
-                _buildScoreCard(cardColor),
+                _buildScoreCard(cardColor, score),
                 const SizedBox(height: 30),
                 const Text(
                   'Recent Threats',
                   style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 16),
-                FutureBuilder<List<Threat>>(
-                  future: _threatsFuture,
-                  builder: (context, snapshot) {
-                    if (snapshot.connectionState == ConnectionState.waiting) {
-                      return const Center(
-                        child: Padding(
-                          padding: EdgeInsets.all(20.0),
-                          child: CircularProgressIndicator(),
-                        ),
-                      );
-                    } else if (snapshot.hasError) {
-                      return _buildErrorState(snapshot.error.toString());
-                    } else if (!snapshot.hasData || snapshot.data!.isEmpty) {
-                      return const Center(child: Text("No threats detected."));
-                    } else {
-                      return Column(
-                        children: snapshot.data!
-                            .take(5)
-                            .map((threat) => ThreatTileData(threat: threat))
-                            .toList(),
-                      );
-                    }
-                  },
-                ),
+                _buildThreatsList(),
               ],
             ),
           ),
@@ -183,7 +235,67 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildScoreCard(Color cardColor) {
+  Widget _buildThreatsList() {
+    try {
+      // Try to get SMS provider for recent detections
+      final smsProvider = context.read<ScamDetectionProvider?>();
+      if (smsProvider != null && smsProvider.messages.isNotEmpty) {
+        return Column(
+          children: smsProvider.recentDetections
+              .take(5)
+              .map((detection) => ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: Colors.orange.withValues(alpha: 0.1),
+                      child: Icon(
+                        detection.isScam ? Icons.warning : Icons.check_circle,
+                        color: detection.isScam ? Colors.red : Colors.green,
+                      ),
+                    ),
+                    title: Text(detection.appName),
+                    subtitle: Text(
+                      detection.isScam ? '⚠️ Scam Detected' : '✅ Safe',
+                      style: TextStyle(
+                        color: detection.isScam ? Colors.red : Colors.green,
+                      ),
+                    ),
+                  ))
+              .toList(),
+        );
+      }
+    } catch (e) {
+      debugPrint('SMS Provider not available: $e');
+    }
+
+    // Fallback to mock data
+    return const Center(
+  child: Padding(
+    padding: EdgeInsets.all(20),
+    child: Text(
+      'No recent threats detected',
+      style: TextStyle(fontSize: 16),
+    ),
+  ),
+);
+  }
+
+  Widget _buildScoreCard(Color cardColor, int score) {
+    Color scoreColor;
+    String scoreStatus;
+
+    if (score >= 80) {
+      scoreColor = Colors.green;
+      scoreStatus = 'Excellent Protection';
+    } else if (score >= 60) {
+      scoreColor = Colors.orange;
+      scoreStatus = 'Good Protection';
+    } else if (score >= 40) {
+      scoreColor = Colors.orangeAccent;
+      scoreStatus = 'Fair Protection';
+    } else {
+      scoreColor = Colors.red;
+      scoreStatus = 'At Risk';
+    }
+
     return Center(
       child: Card(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
@@ -200,43 +312,49 @@ class _HomeScreenState extends State<HomeScreen> {
                     height: 170,
                     width: 170,
                     child: CircularProgressIndicator(
-                      value: 0.87,
+                      value: score / 100,
                       strokeWidth: 18,
                       backgroundColor: Colors.grey.withValues(alpha: 0.2),
-                      color: Colors.green,
+                      color: scoreColor,
                     ),
                   ),
-                  const Column(
+                  Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Text('87', style: TextStyle(fontSize: 52, fontWeight: FontWeight.bold)),
-                      Text('out of 100', style: TextStyle(color: Colors.blue, fontSize: 15)),
+                      Text(
+                        '$score',
+                        style: const TextStyle(
+                          fontSize: 52,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const Text(
+                        'out of 100',
+                        style: TextStyle(color: Colors.blue, fontSize: 15),
+                      ),
                     ],
                   ),
                 ],
               ),
               const SizedBox(height: 25),
-              const Text('↗ +5 from last week', 
-                style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold, fontSize: 15)),
+              Text(
+                scoreStatus,
+                style: TextStyle(
+                  color: scoreColor,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 15,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Based on SMS and Link scanning activity',
+                style: TextStyle(
+                  color: Colors.grey.withOpacity(0.7),
+                  fontSize: 12,
+                ),
+              ),
             ],
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildErrorState(String error) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            const Icon(Icons.error_outline, color: Colors.red, size: 40),
-            const SizedBox(height: 8),
-            Text(error, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
-            const SizedBox(height: 12),
-            ElevatedButton(onPressed: _refreshThreats, child: const Text('Retry')),
-          ],
         ),
       ),
     );
@@ -244,19 +362,43 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 // ================= PLACEHOLDER SCREENS =================
-class SmsScreen extends StatelessWidget { const SmsScreen({super.key}); @override Widget build(BuildContext context) => const Scaffold(body: Center(child: Text('SMS Screen'))); }
-class LinksScreen extends StatelessWidget { const LinksScreen({super.key}); @override Widget build(BuildContext context) => const Scaffold(body: Center(child: Text('Links Screen'))); }
-class ReportScreen extends StatelessWidget { const ReportScreen({super.key}); @override Widget build(BuildContext context) => const Scaffold(body: Center(child: Text('Report Screen'))); }
+
+class SmsScreen extends StatelessWidget {
+  const SmsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) =>
+      const Scaffold(body: Center(child: Text('SMS Screen')));
+}
+
+class LinksScreen extends StatelessWidget {
+  const LinksScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) =>
+      const Scaffold(body: Center(child: Text('Links Screen')));
+}
+
+class ReportScreen extends StatelessWidget {
+  const ReportScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) =>
+      const Scaffold(body: Center(child: Text('Report Screen')));
+}
 
 // ================= PROFILE SCREEN =================
+
 class ProfileScreen extends StatefulWidget {
   final bool isDark;
   final VoidCallback onThemeChanged;
+  final int cyberShieldScore;
 
   const ProfileScreen({
     super.key,
     required this.isDark,
     required this.onThemeChanged,
+    required this.cyberShieldScore,
   });
 
   @override
@@ -296,7 +438,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (newName != null && newName.isNotEmpty) {
       try {
         await user.updateDisplayName(newName);
-        setState(() {}); // Force UI update
+        setState(() {});
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Profile updated successfully')),
@@ -316,20 +458,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Widget build(BuildContext context) {
     final textColor = Theme.of(context).textTheme.bodyLarge?.color;
     final user = FirebaseAuth.instance.currentUser;
-    final displayName = user?.displayName?.isNotEmpty == true ? user!.displayName! : "No name set";
+    final displayName =
+        user?.displayName?.isNotEmpty == true ? user!.displayName! : "No name set";
     final email = user?.email ?? "No email";
 
     return Scaffold(
-      appBar: AppBar(
-        centerTitle: true,
-        title: const Text("Profile"),
-      ),
+      appBar: AppBar(centerTitle: true, title: const Text("Profile")),
       body: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(18, 18, 18, 90),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Profile Card
             Card(
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(22),
@@ -344,10 +483,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       decoration: const BoxDecoration(
                         shape: BoxShape.circle,
                         gradient: LinearGradient(
-                          colors: [
-                            Color(0xFF0066FF),
-                            Color(0xFF00FF99),
-                          ],
+                          colors: [Color(0xFF0066FF), Color(0xFF00FF99)],
                         ),
                       ),
                       child: const Icon(
@@ -363,16 +499,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         children: [
                           Row(
                             children: [
-                              Text(
-                                displayName,
-                                style: TextStyle(
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.bold,
-                                  color: textColor,
+                              Flexible(
+                                child: Text(
+                                  displayName,
+                                  style: TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.bold,
+                                    color: textColor,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ),
                               IconButton(
-                                icon: const Icon(Icons.edit, size: 18, color: Colors.grey),
+                                icon: const Icon(
+                                  Icons.edit,
+                                  size: 18,
+                                  color: Colors.grey,
+                                ),
                                 onPressed: _editName,
                                 padding: EdgeInsets.zero,
                                 constraints: const BoxConstraints(),
@@ -382,22 +525,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           const SizedBox(height: 5),
                           Text(
                             email,
-                            style: TextStyle(
-                              color: textColor?.withOpacity(0.7),
-                            ),
+                            style: TextStyle(color: textColor?.withOpacity(0.7)),
+                            overflow: TextOverflow.ellipsis,
                           ),
                           const SizedBox(height: 10),
-                          const Row(
+                          Row(
                             children: [
-                              Icon(
+                              const Icon(
                                 Icons.shield_outlined,
                                 color: Colors.green,
                                 size: 20,
                               ),
-                              SizedBox(width: 6),
+                              const SizedBox(width: 6),
                               Text(
-                                "CyberShield Score: 87/100",
-                                style: TextStyle(
+                                "CyberShield Score: ${widget.cyberShieldScore}/100",
+                                style: const TextStyle(
                                   color: Colors.green,
                                   fontWeight: FontWeight.w600,
                                 ),
@@ -414,7 +556,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
             const SizedBox(height: 30),
 
-            // Protection Settings
             Text(
               "Protection Settings",
               style: TextStyle(
@@ -431,14 +572,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
               child: Column(
                 children: [
                   ListTile(
-                    leading: const Icon(
-                      Icons.notifications,
-                      color: Colors.blue,
-                    ),
-                    title: Text(
-                      "Notifications",
-                      style: TextStyle(color: textColor),
-                    ),
+                    leading: const Icon(Icons.notifications, color: Colors.blue),
+                    title: Text("Notifications", style: TextStyle(color: textColor)),
                     subtitle: const Text("Get alerts for threats"),
                     trailing: Switch(
                       value: notifications,
@@ -472,7 +607,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
             const SizedBox(height: 30),
 
-            // Security
             Text(
               "Security",
               style: TextStyle(
@@ -512,7 +646,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
             const SizedBox(height: 30),
 
-            // Logout Button
             SizedBox(
               width: double.infinity,
               height: 55,
@@ -526,16 +659,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 onPressed: () {
                   FirebaseAuth.instance.signOut();
                 },
-                icon: const Icon(
-                  Icons.logout,
-                  color: Colors.white,
-                ),
+                icon: const Icon(Icons.logout, color: Colors.white),
                 label: const Text(
                   "Logout",
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 18,
-                  ),
+                  style: TextStyle(color: Colors.white, fontSize: 18),
                 ),
               ),
             ),
@@ -555,43 +682,70 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
     return ListTile(
       leading: Icon(icon, color: Colors.blue),
-      title: Text(
-        title,
-        style: TextStyle(color: textColor),
-      ),
+      title: Text(title, style: TextStyle(color: textColor)),
       subtitle: Text(subtitle),
-      trailing: const Icon(
-        Icons.arrow_forward_ios,
-        size: 16,
-      ),
+      trailing: const Icon(Icons.arrow_forward_ios, size: 16),
       onTap: () {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => screen,
-          ),
-        );
+        Navigator.push(context, MaterialPageRoute(builder: (_) => screen));
       },
     );
   }
 }
 
-// Placeholder classes
-class ChangePasswordScreen extends StatelessWidget { const ChangePasswordScreen({super.key}); @override Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text("Change Password")), body: const Center(child: Text("Change Password screen under construction"))); }
-class PrivacyPolicyScreen extends StatelessWidget { const PrivacyPolicyScreen({super.key}); @override Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text("Privacy Policy")), body: const Center(child: Text("Privacy Policy screen under construction"))); }
-class AboutScreen extends StatelessWidget { const AboutScreen({super.key}); @override Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text("About")), body: const Center(child: Text("About screen under construction"))); }
+// ================= PROFILE SUB SCREENS =================
 
-// ================= THREAT TILES =================
-class ThreatTileData extends StatelessWidget {
-  final Threat threat;
-  const ThreatTileData({super.key, required this.threat});
+class ChangePasswordScreen extends StatelessWidget {
+  const ChangePasswordScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text("Change Password")),
+        body: const Center(child: Text("Change Password screen under construction")),
+      );
+}
+
+class PrivacyPolicyScreen extends StatelessWidget {
+  const PrivacyPolicyScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text("Privacy Policy")),
+        body: const Center(child: Text("Privacy Policy screen under construction")),
+      );
+}
+
+class AboutScreen extends StatelessWidget {
+  const AboutScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text("About")),
+        body: const Center(child: Text("About screen under construction")),
+      );
+}
+
+// ================= THREAT TILE =================
+
+class ThreatTile extends StatelessWidget {
+  final Map<String, dynamic> threat;
+
+  const ThreatTile({super.key, required this.threat});
+
   @override
   Widget build(BuildContext context) {
-    final color = threat.riskScore > 70 ? Colors.red : Colors.orange;
+    final riskScore = threat['riskScore'] as int? ?? 0;
+    final url = threat['url'] as String? ?? 'Unknown';
+    final type = threat['type'] as String? ?? 'Unknown';
+    
+    final color = riskScore > 70 ? Colors.red : Colors.orange;
+
     return ListTile(
-      leading: CircleAvatar(backgroundColor: color.withValues(alpha: 0.1), child: Icon(Icons.warning, color: color)),
-      title: Text(threat.url),
-      subtitle: Text("Risk Score: ${threat.riskScore}%"),
+      leading: CircleAvatar(
+        backgroundColor: color.withValues(alpha: 0.1),
+        child: Icon(Icons.warning, color: color),
+      ),
+      title: Text(url),
+      subtitle: Text('$type • Risk Score: $riskScore%'),
     );
   }
 }
